@@ -328,165 +328,829 @@ export default function ClientLayout({
 
 ### Move `src/app/page.tsx` to (`src/app/(client)/page.tsx`)
 
-## Module 2: API Layer & Global State
+## API Layer & Global State
 
 Here, we'll set up a centralized way to communicate with our API and manage our application's theme.
 
-### Step 2.1: Setting Up the Axios Client
+### Setting Up the Axios Client
 
 It's a best practice to create a centralized Axios instance.
 
-1.  Create a new file at `src/lib/api.ts`.
+1.  Create a new file at `src/services/api.ts`.
 2.  Add the following code to configure a base URL and an interceptor to automatically add the auth token to requests.
+3.  Also add sonner for toast (error messages)
 
-<!-- end list -->
+### Add sonner
+
+```bash
+npx shadcn@latest add sonner
+```
+
+### Configure sonner in root layout `src/app/layout.tsx`
+
+```diff
++import { Toaster } from "@/components/ui/sonner"
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <head />
+      <body>
+        {children}
++        <Toaster />
+      </body>
+    </html>
+  )
+}
+```
 
 ```typescript
-// src/lib/api.ts
+// src/services/api.ts
 import axios from "axios";
+import { toast } from "sonner";
 
-const apiClient = axios.create({
-  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000/api",
+const api = axios.create({
+  baseURL: process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api",
+  timeout: 15000,
   headers: {
     "Content-Type": "application/json",
   },
 });
 
 // Interceptor to add the auth token to every request
-apiClient.interceptors.request.use(
+api.interceptors.request.use(
   (config) => {
     if (typeof window !== "undefined") {
-      const token = localStorage.getItem("authToken");
+      const token = localStorage.getItem("token");
       if (token) {
         config.headers.Authorization = `Bearer ${token}`;
       }
     }
     return config;
   },
+  (error) => Promise.reject(error)
+);
+
+// Response interceptor for error handling
+api.interceptors.response.use(
+  (response) => response,
   (error) => {
+    if (error.response?.status === 401) {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("token");
+        window.location.href = "/auth/login";
+      }
+    }
+
+    const message = error.response?.data?.message || "Something went wrong";
+    toast.error(message);
+
     return Promise.reject(error);
   }
 );
 
-export default apiClient;
+export default api;
 ```
 
 Remember to create a `.env.local` file in your root directory to store your API URL:
-`NEXT_PUBLIC_API_URL=http://localhost:3000/api`
+`NEXT_PUBLIC_API_URL=http://localhost:8080/api`
 
-### Step 2.2: Implementing Theming with Redux Toolkit
+## CRUD Task - Initially GET Task List
 
-We'll use Redux Toolkit to handle our light/dark mode theme.
+### Create `src/types/api.ts`
 
-1.  **Create the Theme Slice:**
-    Create a file at `src/store/themeSlice.ts`.
+```ts
+export interface ApiResponse<T = any> {
+  success: boolean;
+  message: string;
+  data: T;
+}
 
-    ```typescript
-    // src/store/themeSlice.ts
-    import { createSlice, PayloadAction } from "@reduxjs/toolkit";
+export interface ApiError {
+  success: false;
+  message: string;
+  errors?: Record<string, string>;
+}
 
-    type Theme = "light" | "dark" | "system";
+export interface PaginationParams {
+  page?: number;
+  limit?: number;
+}
 
-    interface ThemeState {
-      theme: Theme;
-    }
+export interface PaginatedResponse<T> {
+  data: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+```
 
-    const initialState: ThemeState = {
-      theme: "system",
-    };
+### Create `src/types/task.ts`
 
-    const themeSlice = createSlice({
-      name: "theme",
-      initialState,
-      reducers: {
-        setTheme: (state, action: PayloadAction<Theme>) => {
-          state.theme = action.payload;
-        },
-      },
-    });
+```typescript
+export type Priority = "low" | "medium" | "high";
 
-    export const { setTheme } = themeSlice.actions;
-    export default themeSlice.reducer;
-    ```
+export interface Task {
+  _id: string;
+  title: string;
+  description?: string;
+  completed: boolean;
+  priority: Priority;
+  dueDate?: string;
+  createdAt: string;
+  updatedAt: string;
+}
 
-2.  **Configure the Store:**
-    Create a file at `src/store/store.ts`.
+export interface CreateTaskData {
+  title: string;
+  description?: string;
+  completed?: boolean;
+  priority?: Priority;
+  dueDate?: string;
+}
 
-    ```typescript
-    // src/store/store.ts
-    import { configureStore } from "@reduxjs/toolkit";
-    import themeReducer from "./themeSlice";
+export interface UpdateTaskData extends Partial<CreateTaskData> {}
 
-    export const store = configureStore({
-      reducer: {
-        theme: themeReducer,
-      },
-    });
+export interface TaskFilters {
+  completed?: boolean;
+  priority?: Priority;
+  page?: number;
+  limit?: number;
+}
 
-    export type RootState = ReturnType<typeof store.getState>;
-    export type AppDispatch = typeof store.dispatch;
-    ```
+export interface TaskState {
+  tasks: Task[];
+  currentTask: Task | null;
+  isLoading: boolean;
+  error: string | null;
+  filters: TaskFilters;
+  pagination: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+}
+```
 
-### Step 2.3: Creating a Global Layout and Theme Provider
+### Redux Store Configuration for Task
 
-We need providers for both Redux and React Query.
+#### Create Task Slice (`src/store/taskSlice.ts`)
 
-1.  **Create a Providers Component:**
-    Create a new file at `src/app/providers.tsx`. This must be a client component.
+```typescript
+import { createSlice, createAsyncThunk } from "@reduxjs/toolkit";
+import {
+  TaskState,
+  CreateTaskData,
+  UpdateTaskData,
+  TaskFilters,
+} from "@/types/task";
+import { tasksService } from "@/services/tasks";
 
-    ```typescript
-    // src/app/providers.tsx
-    "use client";
+// Initial state
+const initialState: TaskState = {
+  tasks: [],
+  currentTask: null,
+  isLoading: false,
+  error: null,
+  filters: {
+    page: 1,
+    limit: 10,
+  },
+  pagination: {
+    page: 1,
+    limit: 10,
+    total: 0,
+    totalPages: 0,
+  },
+};
 
-    import { useState } from "react";
-    import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-    import { Provider as ReduxProvider } from "react-redux";
-    import { store } from "@/store/store";
-
-    export function Providers({ children }: { children: React.ReactNode }) {
-      const [queryClient] = useState(() => new QueryClient());
-
-      return (
-        <ReduxProvider store={store}>
-          <QueryClientProvider client={queryClient}>
-            {children}
-          </QueryClientProvider>
-        </ReduxProvider>
+// Async thunks
+export const fetchTasks = createAsyncThunk(
+  "tasks/fetchTasks",
+  async (filters: TaskFilters = {}, { rejectWithValue }) => {
+    try {
+      const response = await tasksService.getTasks(filters);
+      return response;
+    } catch (error: any) {
+      return rejectWithValue(
+        error.response?.data?.message || "Failed to fetch tasks"
       );
     }
-    ```
+  }
+);
 
-2.  **Update Root Layout:**
-    Modify `src/app/layout.tsx` to include the `Providers`.
-
-    ```typescript
-    // src/app/layout.tsx
-    import type { Metadata } from "next";
-    import { Inter } from "next/font/google";
-    import "./globals.css";
-    import { Providers } from "./providers";
-
-    const inter = Inter({ subsets: ["latin"] });
-
-    export const metadata: Metadata = {
-      title: "Task Manager",
-      description: "A simple task management app",
-    };
-
-    export default function RootLayout({
-      children,
-    }: {
-      children: React.ReactNode;
-    }) {
-      return (
-        <html lang="en" suppressHydrationWarning>
-          <body className={inter.className}>
-            <Providers>{children}</Providers>
-          </body>
-        </html>
+export const fetchTask = createAsyncThunk(
+  "tasks/fetchTask",
+  async (id: string, { rejectWithValue }) => {
+    try {
+      const response = await tasksService.getTask(id);
+      return response.data;
+    } catch (error: any) {
+      return rejectWithValue(
+        error.response?.data?.message || "Failed to fetch task"
       );
     }
-    ```
+  }
+);
+
+export const createTask = createAsyncThunk(
+  "tasks/createTask",
+  async (data: CreateTaskData, { rejectWithValue }) => {
+    try {
+      const response = await tasksService.createTask(data);
+      return response.data;
+    } catch (error: any) {
+      return rejectWithValue(
+        error.response?.data?.message || "Failed to create task"
+      );
+    }
+  }
+);
+
+export const updateTask = createAsyncThunk(
+  "tasks/updateTask",
+  async (
+    { id, data }: { id: string; data: UpdateTaskData },
+    { rejectWithValue }
+  ) => {
+    try {
+      const response = await tasksService.updateTask(id, data);
+      return response.data;
+    } catch (error: any) {
+      return rejectWithValue(
+        error.response?.data?.message || "Failed to update task"
+      );
+    }
+  }
+);
+
+export const deleteTask = createAsyncThunk(
+  "tasks/deleteTask",
+  async (id: string, { rejectWithValue }) => {
+    try {
+      await tasksService.deleteTask(id);
+      return id;
+    } catch (error: any) {
+      return rejectWithValue(
+        error.response?.data?.message || "Failed to delete task"
+      );
+    }
+  }
+);
+
+// Task slice
+const taskSlice = createSlice({
+  name: "tasks",
+  initialState,
+  reducers: {
+    setFilters: (state, action) => {
+      state.filters = { ...state.filters, ...action.payload };
+    },
+    clearCurrentTask: (state) => {
+      state.currentTask = null;
+    },
+    clearError: (state) => {
+      state.error = null;
+    },
+  },
+  extraReducers: (builder) => {
+    builder
+      // Fetch tasks
+      .addCase(fetchTasks.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(fetchTasks.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.tasks = action.payload.data;
+        state.pagination = {
+          page: action.payload.page,
+          limit: action.payload.limit,
+          total: action.payload.total,
+          totalPages: action.payload.totalPages,
+        };
+      })
+      .addCase(fetchTasks.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+      // Fetch single task
+      .addCase(fetchTask.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(fetchTask.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.currentTask = action.payload;
+      })
+      .addCase(fetchTask.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+      // Create task
+      .addCase(createTask.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(createTask.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.tasks.unshift(action.payload);
+      })
+      .addCase(createTask.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+      // Update task
+      .addCase(updateTask.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(updateTask.fulfilled, (state, action) => {
+        state.isLoading = false;
+        const index = state.tasks.findIndex(
+          (task) => task._id === action.payload._id
+        );
+        if (index !== -1) {
+          state.tasks[index] = action.payload;
+        }
+        if (state.currentTask?._id === action.payload._id) {
+          state.currentTask = action.payload;
+        }
+      })
+      .addCase(updateTask.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      })
+      // Delete task
+      .addCase(deleteTask.pending, (state) => {
+        state.isLoading = true;
+        state.error = null;
+      })
+      .addCase(deleteTask.fulfilled, (state, action) => {
+        state.isLoading = false;
+        state.tasks = state.tasks.filter((task) => task._id !== action.payload);
+        if (state.currentTask?._id === action.payload) {
+          state.currentTask = null;
+        }
+      })
+      .addCase(deleteTask.rejected, (state, action) => {
+        state.isLoading = false;
+        state.error = action.payload as string;
+      });
+  },
+});
+
+export const { setFilters, clearCurrentTask, clearError } = taskSlice.actions;
+export default taskSlice.reducer;
+```
+
+### Configure Store (`src/store/index.ts`)
+
+```typescript
+import { configureStore } from "@reduxjs/toolkit";
+import taskReducer from "./taskSlice";
+
+export const store = configureStore({
+  reducer: {
+    // auth: authReducer,
+    tasks: taskReducer,
+  },
+  middleware: (getDefaultMiddleware) =>
+    getDefaultMiddleware({
+      serializableCheck: {
+        ignoredActions: ["persist/PERSIST"],
+      },
+    }),
+});
+
+export type RootState = ReturnType<typeof store.getState>;
+export type AppDispatch = typeof store.dispatch;
+```
+
+### Create Tasks Service (`src/services/tasks.ts`)
+
+```typescript
+import api from "./api";
+import {
+  Task,
+  CreateTaskData,
+  UpdateTaskData,
+  TaskFilters,
+} from "@/types/task";
+import { ApiResponse, PaginatedResponse } from "@/types/api";
+
+export const tasksService = {
+  async getTasks(filters?: TaskFilters): Promise<PaginatedResponse<Task>> {
+    const params = new URLSearchParams();
+
+    if (filters?.completed !== undefined) {
+      params.append("completed", String(filters.completed));
+    }
+    if (filters?.priority) {
+      params.append("priority", filters.priority);
+    }
+    if (filters?.page) {
+      params.append("page", String(filters.page));
+    }
+    if (filters?.limit) {
+      params.append("limit", String(filters.limit));
+    }
+
+    return api.get<PaginatedResponse<Task>>(`/api/tasks?${params.toString()}`);
+  },
+
+  async getTask(id: string): Promise<ApiResponse<Task>> {
+    return api.get<ApiResponse<Task>>(`/api/tasks/${id}`);
+  },
+
+  async createTask(data: CreateTaskData): Promise<ApiResponse<Task>> {
+    return api.post<ApiResponse<Task>>("/api/tasks", data);
+  },
+
+  async updateTask(
+    id: string,
+    data: UpdateTaskData
+  ): Promise<ApiResponse<Task>> {
+    return api.put<ApiResponse<Task>>(`/api/tasks/${id}`, data);
+  },
+
+  async deleteTask(id: string): Promise<ApiResponse<void>> {
+    return api.delete<ApiResponse<void>>(`/api/tasks/${id}`);
+  },
+};
+```
+
+### Create Tasks Hook (`src/hooks/useTasks.ts`)
+
+```typescript
+import { useSelector, useDispatch } from "react-redux";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { RootState, AppDispatch } from "@/store";
+import {
+  fetchTasks,
+  createTask,
+  updateTask,
+  deleteTask,
+  setFilters,
+} from "@/store/taskSlice";
+import { CreateTaskData, UpdateTaskData, TaskFilters } from "@/types/task";
+import { toast } from "sonner";
+
+export const useTasks = () => {
+  const dispatch = useDispatch<AppDispatch>();
+  const queryClient = useQueryClient();
+  const { tasks, isLoading, error, filters, pagination } = useSelector(
+    (state: RootState) => state.tasks
+  );
+
+  // Fetch tasks with React Query
+  const {
+    data: tasksData,
+    isLoading: isQueryLoading,
+    refetch: refetchTasks,
+  } = useQuery({
+    queryKey: ["tasks", filters],
+    queryFn: () => dispatch(fetchTasks(filters)),
+    enabled: true,
+  });
+
+  // Create task mutation
+  const createTaskMutation = useMutation({
+    mutationFn: (data: CreateTaskData) => dispatch(createTask(data)),
+    onSuccess: () => {
+      toast.success("Task created successfully");
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: (error: any) => {
+      toast.error(error.message || "Failed to create task");
+    },
+  });
+
+  // Update task mutation
+  const updateTaskMutation = useMutation({
+    mutationFn: ({ id, data }: { id: string; data: UpdateTaskData }) =>
+      dispatch(updateTask({ id, data })),
+    onSuccess: () => {
+      toast.success("Task updated successfully");
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: (error: any) => {
+      toast.error(error.message || "Failed to update task");
+    },
+  });
+
+  // Delete task mutation
+  const deleteTaskMutation = useMutation({
+    mutationFn: (id: string) => dispatch(deleteTask(id)),
+    onSuccess: () => {
+      toast.success("Task deleted successfully");
+      queryClient.invalidateQueries({ queryKey: ["tasks"] });
+    },
+    onError: (error: any) => {
+      toast.error(error.message || "Failed to delete task");
+    },
+  });
+
+  const handleCreateTask = (data: CreateTaskData) => {
+    createTaskMutation.mutate(data);
+  };
+
+  const handleUpdateTask = (id: string, data: UpdateTaskData) => {
+    updateTaskMutation.mutate({ id, data });
+  };
+
+  const handleDeleteTask = (id: string) => {
+    deleteTaskMutation.mutate(id);
+  };
+
+  const handleToggleComplete = (id: string, completed: boolean) => {
+    updateTaskMutation.mutate({ id, data: { completed } });
+  };
+
+  const updateFilters = (newFilters: Partial<TaskFilters>) => {
+    dispatch(setFilters(newFilters));
+  };
+
+  return {
+    tasks,
+    isLoading: isLoading || isQueryLoading,
+    error,
+    filters,
+    pagination,
+    handleCreateTask,
+    handleUpdateTask,
+    handleDeleteTask,
+    handleToggleComplete,
+    updateFilters,
+    refetchTasks,
+    isCreating: createTaskMutation.isPending,
+    isUpdating: updateTaskMutation.isPending,
+    isDeleting: deleteTaskMutation.isPending,
+  };
+};
+```
+
+### Create Tasks List Component (`src/components/tasks/TasksList.tsx`)
+
+```typescript
+"use client";
+
+import { useState } from "react";
+import { useTasks } from "@/hooks/useTasks";
+import { TaskCard } from "./TaskCard";
+import { TaskForm } from "./TaskForm";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Plus, Search, Filter } from "lucide-react";
+import { Task, Priority, TaskFormData } from "@/types/task";
+
+export const TasksList = () => {
+  const {
+    tasks,
+    isLoading,
+    filters,
+    pagination,
+    handleCreateTask,
+    handleUpdateTask,
+    handleDeleteTask,
+    handleToggleComplete,
+    updateFilters,
+    isCreating,
+    isUpdating,
+  } = useTasks();
+
+  const [isFormOpen, setIsFormOpen] = useState(false);
+  const [editingTask, setEditingTask] = useState<Task | null>(null);
+  const [searchTerm, setSearchTerm] = useState("");
+
+  const handleCreateSubmit = (data: TaskFormData) => {
+    const taskData = {
+      ...data,
+      dueDate: data.dueDate ? new Date(data.dueDate).toISOString() : undefined,
+    };
+    handleCreateTask(taskData);
+    setIsFormOpen(false);
+  };
+
+  const handleEditSubmit = (data: TaskFormData) => {
+    if (editingTask) {
+      const taskData = {
+        ...data,
+        dueDate: data.dueDate
+          ? new Date(data.dueDate).toISOString()
+          : undefined,
+      };
+      handleUpdateTask(editingTask._id, taskData);
+      setEditingTask(null);
+    }
+  };
+
+  const handleEdit = (task: Task) => {
+    setEditingTask(task);
+  };
+
+  const handleDelete = (id: string) => {
+    if (confirm("Are you sure you want to delete this task?")) {
+      handleDeleteTask(id);
+    }
+  };
+
+  const handleFilterChange = (key: string, value: any) => {
+    updateFilters({ [key]: value, page: 1 });
+  };
+
+  const clearFilters = () => {
+    updateFilters({ completed: undefined, priority: undefined, page: 1 });
+  };
+
+  const filteredTasks = tasks.filter(
+    (task) =>
+      task.title.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      (task.description &&
+        task.description.toLowerCase().includes(searchTerm.toLowerCase()))
+  );
+
+  if (isLoading) {
+    return (
+      <div className="space-y-4">
+        {[...Array(6)].map((_, i) => (
+          <Skeleton key={i} className="h-32 w-full" />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div className="flex justify-between items-center">
+        <h1 className="text-3xl font-bold">Tasks</h1>
+        <Button onClick={() => setIsFormOpen(true)}>
+          <Plus className="mr-2 h-4 w-4" />
+          Add Task
+        </Button>
+      </div>
+
+      {/* Filters */}
+      <div className="flex flex-col sm:flex-row gap-4">
+        <div className="relative flex-1">
+          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+          <Input
+            placeholder="Search tasks..."
+            value={searchTerm}
+            onChange={(e) => setSearchTerm(e.target.value)}
+            className="pl-10"
+          />
+        </div>
+
+        <Select
+          value={filters.completed?.toString() || "all"}
+          onValueChange={(value) =>
+            handleFilterChange(
+              "completed",
+              value === "all" ? undefined : value === "true"
+            )
+          }
+        >
+          <SelectTrigger className="w-full sm:w-48">
+            <SelectValue placeholder="Filter by status" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All Tasks</SelectItem>
+            <SelectItem value="false">Active</SelectItem>
+            <SelectItem value="true">Completed</SelectItem>
+          </SelectContent>
+        </Select>
+
+        <Select
+          value={filters.priority || "all"}
+          onValueChange={(value) =>
+            handleFilterChange("priority", value === "all" ? undefined : value)
+          }
+        >
+          <SelectTrigger className="w-full sm:w-48">
+            <SelectValue placeholder="Filter by priority" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All Priorities</SelectItem>
+            <SelectItem value="high">High</SelectItem>
+            <SelectItem value="medium">Medium</SelectItem>
+            <SelectItem value="low">Low</SelectItem>
+          </SelectContent>
+        </Select>
+
+        {(filters.completed !== undefined || filters.priority) && (
+          <Button variant="outline" onClick={clearFilters}>
+            <Filter className="mr-2 h-4 w-4" />
+            Clear
+          </Button>
+        )}
+      </div>
+
+      {/* Active Filters */}
+      {(filters.completed !== undefined || filters.priority) && (
+        <div className="flex gap-2">
+          {filters.completed !== undefined && (
+            <Badge variant="secondary">
+              Status: {filters.completed ? "Completed" : "Active"}
+            </Badge>
+          )}
+          {filters.priority && (
+            <Badge variant="secondary">Priority: {filters.priority}</Badge>
+          )}
+        </div>
+      )}
+
+      {/* Tasks Grid */}
+      {filteredTasks.length === 0 ? (
+        <div className="text-center py-12">
+          <p className="text-gray-500 mb-4">
+            {tasks.length === 0
+              ? "No tasks yet."
+              : "No tasks match your search."}
+          </p>
+          <Button onClick={() => setIsFormOpen(true)}>
+            <Plus className="mr-2 h-4 w-4" />
+            Create your first task
+          </Button>
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {filteredTasks.map((task) => (
+            <TaskCard
+              key={task._id}
+              task={task}
+              onToggleComplete={handleToggleComplete}
+              onEdit={handleEdit}
+              onDelete={handleDelete}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Pagination */}
+      {pagination.totalPages > 1 && (
+        <div className="flex justify-center space-x-2">
+          <Button
+            variant="outline"
+            onClick={() => updateFilters({ page: pagination.page - 1 })}
+            disabled={pagination.page === 1}
+          >
+            Previous
+          </Button>
+          <span className="flex items-center px-4">
+            Page {pagination.page} of {pagination.totalPages}
+          </span>
+          <Button
+            variant="outline"
+            onClick={() => updateFilters({ page: pagination.page + 1 })}
+            disabled={pagination.page === pagination.totalPages}
+          >
+            Next
+          </Button>
+        </div>
+      )}
+
+      {/* Task Forms */}
+      <TaskForm
+        isOpen={isFormOpen}
+        onClose={() => setIsFormOpen(false)}
+        onSubmit={handleCreateSubmit}
+        isLoading={isCreating}
+      />
+
+      <TaskForm
+        isOpen={!!editingTask}
+        onClose={() => setEditingTask(null)}
+        onSubmit={handleEditSubmit}
+        task={editingTask}
+        isLoading={isUpdating}
+      />
+    </div>
+  );
+};
+```
+
+### Create Tasks Page (`src/app/tasks/page.tsx`)
+
+```typescript
+import { TasksList } from "@/components/tasks/TasksList";
+
+export default function TasksPage() {
+  return <TasksList />;
+}
+```
 
 ---
 
