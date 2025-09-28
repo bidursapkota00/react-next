@@ -109,7 +109,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8080
 
 ### Project Structure
 
-```
+```text
 src/
 ├── app/
 │   ├── auth/
